@@ -77,6 +77,7 @@ def settings() -> Settings:
         output_cost_per_1k="0.004",
         admin_api_key=ADMIN_KEY,
         cache_enabled=False,
+        routing_enabled=False,
     )
 
 

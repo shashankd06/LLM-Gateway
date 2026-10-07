@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     cache_ttl_seconds: int = Field(default=3600, gt=0)
     cache_share_across_keys: bool = False
     embedding_cache_dir: str | None = None
+    routing_enabled: bool = True
+    routing_config_path: str = "routing.yaml"
 
     @model_validator(mode="after")
     def validate_provider_configuration(self) -> "Settings":

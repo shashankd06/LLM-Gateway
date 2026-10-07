@@ -1,5 +1,5 @@
 {
-  "model": "qwen2.5:1.5b",
+  "model": "auto",
   "messages": [
     {"role": "system", "content": "Answer briefly and accurately."},
     {"role": "user", "content": "What is the capital of France?"}

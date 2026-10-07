@@ -49,12 +49,16 @@ class CacheQuery:
     prompt_hash: str
     context_hash: str
     semantic_allowed: bool
+    provider: str
 
 
 @dataclass(frozen=True)
 class CacheLookup:
     response: ProviderResponse | None
     embedding: list[float] | None
+    model: str | None = None
+    provider: str | None = None
+    tier: str | None = None
 
 
 class SemanticCache:
@@ -77,6 +81,7 @@ class SemanticCache:
         model: str,
         params: GenerationParams,
         messages: list[dict[str, str]],
+        policy: str | None = None,
     ) -> CacheQuery:
         endpoint = (
             self.settings.openai_compat_base_url
@@ -85,13 +90,14 @@ class SemanticCache:
         )
         return CacheQuery(
             api_key_id=key_id,
-            namespace=fingerprint(["cache-v1", MODEL_NAME, provider, endpoint]),
+            namespace=fingerprint(["cache-v2", MODEL_NAME, provider, endpoint, policy]),
             model=model,
             params_hash=fingerprint(params.model_dump(mode="json")),
             prompt_hash=fingerprint(messages),
             # Only the final user question may vary; prior turns and instructions must match.
             context_hash=fingerprint(messages[:-1]),
             semantic_allowed=messages[-1]["role"] == "user",
+            provider=provider,
         )
 
     def candidates(self, query: CacheQuery) -> Select[tuple[CacheEntry]]:
@@ -118,6 +124,31 @@ class SemanticCache:
         )
 
     async def lookup(self, query: CacheQuery, prompt: str) -> CacheLookup:
+        return await self.lookup_many([query], prompt)
+
+    def hit(self, entry: CacheEntry, vector: list[float] | None) -> CacheLookup:
+        return CacheLookup(self.response(entry), vector, entry.model, entry.provider, entry.tier)
+
+    async def lookup_many(self, queries: list[CacheQuery], prompt: str) -> CacheLookup:
+        # All exact candidates are checked before any embedding work, even across fallback tiers.
+        for query in queries:
+            exact = await self.exact(query)
+            if exact is not None:
+                return self.hit(exact, None)
+        if not queries[0].semantic_allowed:
+            return CacheLookup(None, None)
+        vector = await self.embedder.embed(prompt)
+        if vector is None:
+            return CacheLookup(None, None)
+        if not valid_vector(vector):
+            raise ValueError("Embedder returned an invalid vector")
+        for query in queries:
+            entry = await self.nearest(query, vector)
+            if entry is not None:
+                return self.hit(entry, vector)
+        return CacheLookup(None, vector)
+
+    async def exact(self, query: CacheQuery) -> CacheEntry | None:
         async with self.sessions() as session:
             exact = await session.scalar(
                 self.candidates(query)
@@ -125,16 +156,9 @@ class SemanticCache:
                 .order_by(CacheEntry.created_at.desc(), CacheEntry.id)
                 .limit(1)
             )
-        if exact is not None:
-            return CacheLookup(self.response(exact), None)
-        if not query.semantic_allowed:
-            return CacheLookup(None, None)
-        # No connection is held while the worker loads the model or computes its embedding.
-        vector = await self.embedder.embed(prompt)
-        if vector is None:
-            return CacheLookup(None, None)
-        if not valid_vector(vector):
-            raise ValueError("Embedder returned an invalid vector")
+        return exact
+
+    async def nearest(self, query: CacheQuery, vector: list[float]) -> CacheEntry | None:
         async with self.sessions() as session:
             statement = self.candidates(query).where(CacheEntry.embedding.is_not(None))
             if session.get_bind().dialect.name == "postgresql":
@@ -156,13 +180,14 @@ class SemanticCache:
                     self.settings.cache_similarity_threshold
                 ):
                     entry = None
-        return CacheLookup(self.response(entry) if entry is not None else None, vector)
+        return entry
 
     async def store(
         self,
         query: CacheQuery,
         result: ProviderResponse,
         embedding: list[float] | None,
+        tier: str = "direct",
     ) -> None:
         if not result.text.strip():
             return
@@ -177,6 +202,8 @@ class SemanticCache:
             "embedding": embedding,
             "response_text": result.text,
             "finish_reason": result.finish_reason,
+            "provider": query.provider,
+            "tier": tier,
             "created_at": now,
             "expires_at": now + timedelta(seconds=self.settings.cache_ttl_seconds),
         }

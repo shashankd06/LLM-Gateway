@@ -1,0 +1,19 @@
+# Provider URLs and optional keys stay in .env, never in this file.
+tiers:
+  cheap:
+    provider: ollama
+    model: qwen2.5:1.5b
+    timeout_seconds: 60
+  strong:
+    provider: ollama
+    model: qwen2.5:7b
+    timeout_seconds: 120
+retry:
+  max_attempts: 2  # Includes the first attempt; retry upstream errors/timeouts only.
+  backoff_base_seconds: 0.25
+  backoff_max_seconds: 2
+circuit_breaker:
+  failure_threshold: 5
+  recovery_seconds: 30
+confidence:
+  min_response_chars: 12

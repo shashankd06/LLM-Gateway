@@ -76,6 +76,8 @@ class CacheEntry(Base):
     )
     response_text: Mapped[str] = mapped_column(Text)
     finish_reason: Mapped[str] = mapped_column(String(10))
+    provider: Mapped[str] = mapped_column(String(40), default="legacy")
+    tier: Mapped[str] = mapped_column(String(10), default="direct")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
@@ -98,6 +100,7 @@ class RequestLog(Base):
         CheckConstraint("estimated_cost >= 0", name="ck_cost_nonnegative"),
         CheckConstraint("cache_status IN ('hit', 'miss', 'bypass')", name="ck_cache_status"),
         CheckConstraint("budget_tokens >= 0", name="ck_request_budget_nonnegative"),
+        CheckConstraint("attempts >= 0", name="ck_request_attempts_nonnegative"),
         Index("ix_request_logs_created_at", "created_at"),
         Index("ix_request_logs_api_key_created_at", "api_key_id", "created_at"),
     )
@@ -111,6 +114,9 @@ class RequestLog(Base):
     budget_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
     model: Mapped[str] = mapped_column(String(200))
     provider: Mapped[str] = mapped_column(String(40))
+    tier: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    escalation_reason: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    attempts: Mapped[int] = mapped_column(default=0)
     prompt_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     input_tokens: Mapped[int] = mapped_column(default=0)
     output_tokens: Mapped[int] = mapped_column(default=0)

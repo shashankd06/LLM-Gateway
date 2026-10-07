@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir
     && mkdir -p /home/gateway/.cache/embeddings \
     && chown -R gateway:gateway /home/gateway/.cache
 COPY alembic.ini ./
+COPY routing.yaml ./
 USER gateway
 EXPOSE 8000
 CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000"]

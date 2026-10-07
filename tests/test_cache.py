@@ -409,6 +409,7 @@ async def test_embedding_cancellation_charges_no_inference(
             api_key,
             app.state.rate_limiter,
             app.state.cache,
+            app.state.model_router,
         )
     async with make_session_factory(engine)() as session:
         log = (await session.scalars(select(RequestLog))).one()

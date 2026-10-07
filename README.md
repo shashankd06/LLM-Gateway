@@ -5,9 +5,9 @@ accounting, caching, routing, and failure handling individually. This project pu
 those responsibilities behind a small OpenAI-style API and measures their effect
 on latency, hypothetical cost, and answer quality.
 
-**Current milestone: Phase 3 — exact and semantic caching.** The core proxy,
-hashed API keys, concurrent rate limits, daily budgets, and semantic cache are
-implemented. Routing, evaluation, and the dashboard follow in later phases.
+**Current milestone: Phase 4 — model routing, fallback, retries, and circuit breakers.**
+The core proxy, hashed keys, concurrent limits, token budgets, semantic cache,
+and routing are implemented. Evaluation and the dashboard follow in later phases.
 No end-to-end model benchmark results exist yet.
 
 ## Architecture
@@ -21,7 +21,8 @@ flowchart LR
     Cache --> DB[(PostgreSQL 16 + pgvector)]
     Cache -- hit --> Logs[Settle reported usage + request outcome]
     Cache -- miss or bypass --> Budget[Atomic inference budget reservation]
-    Budget --> Adapter[ProviderAdapter]
+    Budget --> Router[Cheap then strong: confidence check and bounded retries]
+    Router --> Adapter[ProviderAdapter + per-provider circuit breaker]
     Adapter --> Ollama[Host Ollama: default]
     Adapter -. explicitly enabled .-> Compatible[OpenAI-style endpoint]
     Limits --> DB[(PostgreSQL 16 + pgvector)]
@@ -43,6 +44,7 @@ from the project directory:
 
 ```sh
 ollama pull qwen2.5:1.5b
+ollama pull qwen2.5:7b
 cp .env.example .env
 docker compose up
 ```
@@ -97,8 +99,8 @@ value once. Use that client key for chat requests:
 curl -i http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" -H "Authorization: Bearer <CLIENT_API_KEY>" --data-binary @examples/chat.json
 ```
 
-`DEFAULT_MODEL` applies when the request omits `model`. Change the example's model
-if you pull a different one. Health checks test reachability without inference;
+With routing enabled, omitting `model` selects cheap followed by strong if needed.
+Edit `routing.yaml` to change the two model names. Health checks test reachability without inference;
 they do not confirm that a requested model has been pulled.
 
 ## API
@@ -123,8 +125,12 @@ the configured maximum of 4096 are rejected before inference. In `/docs`, use
 Successful completions and provider failures include `X-Request-ID` matching the
 database row and `X-Cache: HIT`, `MISS`, or `BYPASS`. Add `"cache": false` to a chat
 request to skip both cache reads and writes. Provider
-timeouts return 504, other upstream failures return 502, unexpected adapter errors
-return 500, and database logging failures return 503. No retry or fallback runs yet.
+timeouts return 504 after bounded attempts, other upstream failures return 502,
+unexpected adapter errors return 500, and database logging failures return 503.
+When eligible provider circuits cannot accept a call, return 503 with `Retry-After`.
+Success responses also include `X-Tier`, `X-Provider-Attempts`, and, when the
+current request escalated, `X-Escalation-Reason`. The response's `model` names the
+actual serving model. Cache hits report zero attempts and no current escalation.
 
 Missing, unknown, or inactive client keys return 401 with `WWW-Authenticate:
 Bearer`. Rate or budget rejections return 429 with a positive integer
@@ -141,7 +147,7 @@ taking precedence. See `.env.example` for the minimal local setup.
 | --- | --- |
 | `DATABASE_URL` | Required async SQLAlchemy URL: `postgresql+asyncpg://...` |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` |
-| `DEFAULT_MODEL` | `qwen2.5:1.5b` |
+| `DEFAULT_MODEL` | `qwen2.5:1.5b`; default when routing is disabled |
 | `PROVIDER_TIMEOUT_SECONDS` | HTTPX timeout per network operation: 120 seconds |
 | `HEALTH_TIMEOUT_SECONDS` | Provider health request timeout: 5 seconds |
 | `DEFAULT_PROVIDER` | `ollama`, or explicitly enabled `openai_compat` |
@@ -158,6 +164,8 @@ taking precedence. See `.env.example` for the minimal local setup.
 | `CACHE_TTL_SECONDS` | `3600`; fixed expiry from generation time, not extended by hits |
 | `CACHE_SHARE_ACROSS_KEYS` | `false`; explicitly opt in to sharing responses between keys |
 | `EMBEDDING_CACHE_DIR` | Optional model directory; Compose sets a persistent writable volume |
+| `ROUTING_ENABLED` | `true`; `false` restores single-call direct proxy behavior |
+| `ROUTING_CONFIG_PATH` | `routing.yaml`; validated once at startup |
 
 The optional OpenAI-compatible adapter remains disabled by default. Selecting it
 requires `OPENAI_COMPAT_ENABLED=true` and a base URL; otherwise startup fails
@@ -184,15 +192,23 @@ provider. Bypassed requests reserve tokens during admission. The locks and
 connections are released before CPU embedding work and inference. All workers use the same database
 state; there is no process-local rate counter or lock.
 
-The hold reserves UTF-8 prompt bytes + template padding + maximum output tokens.
+Each attempt's allowance is UTF-8 prompt bytes + template padding + maximum output
+tokens. Admission reserves it times the maximum attempts per tier times the
+number of eligible tiers. The default auto route covers up to four calls: two
+cheap and two strong. A request can be budget-rejected even if one successful
+cheap call would have fit the remaining balance.
 This conservative input estimate avoids needing a different tokenizer dependency
 for each provider. Successful calls reconcile the hold against the provider's
-actual input + output token counts. Budget accounting and final log updates are
+actual input + output token counts across all completed calls, including a cheap
+answer rejected by the heuristic. Failed attempts with unknown usage retain their
+individual allowance; unused retry/fallback allowances are refunded at settlement.
+Budget accounting and final log updates are
 atomic and settlement is idempotent. `budget_tokens` records the charged allowance;
 ordinary token columns record reported usage.
 
-Failed calls with unknown usage retain their reservation. A process crash leaves
-an `in_progress` row and a retained hold, rather than refunding potentially consumed
+Failed calls with unknown usage retain an allowance for each started attempt.
+A process crash leaves the full committed route hold and an `in_progress` row
+because progress is unknown, rather than refunding potentially consumed
 tokens. This favors budget safety over availability; no automatic same-day refund
 or recovery endpoint is implemented. Calls finishing after midnight settle their
 day of their inference reservation. If cache lookup crosses midnight, reservation
@@ -211,6 +227,58 @@ concurrent reservations are bounded, but an exact upstream-consumption ceiling
 cannot be guaranteed for every opaque provider. Increase padding for unusual
 templates; this behavior has a dedicated overrun test.
 
+## Routing, fallback, and recovery
+
+`routing.yaml` defines two tiers and their attempt deadlines, retry policy,
+provider circuits, and short-answer threshold. It contains no keys or provider
+URLs. With routing enabled:
+
+| Request model | Behavior |
+| --- | --- |
+| Omitted, `auto`, or `cheap` | Try cheap, then escalate to strong when needed |
+| `strong` | Strong tier only; useful for the evaluation baseline |
+| Any explicit model name | Direct request to the configured default provider; no confidence escalation |
+
+All enabled routes have bounded retries and circuits, including direct requests.
+Setting `ROUTING_ENABLED=false` disables those policies and uses one direct call.
+The response always reports the actual model, not the requested alias. The
+request log stores `tier`, `escalation_reason`, and the number of upstream
+`attempts`, alongside usage and latency. Retries and fallback consume one RPM
+allowance for the client request, not one per upstream attempt.
+
+Cheap responses escalate when they are empty, shorter than the configured
+12-character default, begin with a refusal pattern, or fail JSON-object parsing
+when JSON was requested. Valid small JSON objects are exempt from the length
+check. Completed low-confidence answers are not retried on cheap. Strong is the
+final tier; it may return a short answer or refusal, but empty responses and
+malformed requested JSON produce a sanitized error. These heuristics can send
+correct short factual answers to strong, and do not establish factual correctness.
+
+Provider errors/timeouts are retried with full jitter:
+`uniform(0, min(max_delay, base_delay * 2**retry_index))`. Default attempts per
+tier are 2, with 0.25-second base and 2-second maximum backoff. Unexpected bugs
+and client cancellations are not retried. An attempt has a wall-clock deadline
+using [Python's asyncio timeout](https://docs.python.org/3.11/library/asyncio-task.html#timeouts),
+in addition to HTTPX's per-operation timeout. Slow local inference may require
+larger tier deadlines. There is no separate whole-request deadline.
+
+The [circuit breaker](https://learn.microsoft.com/en-us/azure/architecture/patterns/circuit-breaker)
+opens after five consecutive completed transport failures on a provider. It
+skips new upstream calls for 30 seconds, then admits exactly one half-open probe.
+A successful probe closes it; failure or cancellation reopens it. Concurrent
+state transitions use an asyncio lock and generation numbers prevent stale
+completions reopening/closing a newer circuit. Breakers are per provider and
+per process. Both Ollama tiers share a breaker; an Ollama outage can block both.
+Different provider types have independent breakers. Restarts reset circuit state;
+it is not synchronized across multiple gateway processes. `/health` checks the
+default provider's reachability, not every tier's loaded model or breaker state.
+
+To route a tier to the optional compatible adapter, explicitly enable it in
+`.env`, set its URL, and use `provider: openai_compat` in YAML. Startup rejects
+references to a disabled provider. No paid service is required: both committed
+tiers use host Ollama. YAML uses safe loading and validated fields, and changes
+take effect after restarting the gateway.
+
 ## Semantic cache behavior
 
 Lookup first matches the structured prompt hash without computing an embedding.
@@ -223,6 +291,14 @@ Only the final user message may vary semantically; previous turns and system
 instructions must match exactly. Changing the upstream URL changes the cache
 namespace. If you replace a model's weights under the same name, clear its cache
 or wait for TTL expiry.
+
+For auto routes, cache lookup prefers a strong entry when available and checks
+all eligible exact matches before computing one embedding for semantic lookup.
+Rows store the actual serving model, provider, and tier. The routing policy is
+part of the namespace, so strong-only and direct requests cannot receive a cheap
+auto-route answer. Policy changes invalidate reuse. Migration 0004 adds provenance
+fields; the new cache namespace also prevents reuse of older Phase 3 entries.
+Cached strong responses are logged as strong hits without a new escalation.
 
 The [MiniLM model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
 documents 384-dimensional embeddings and truncation beyond 256 word pieces.
@@ -292,7 +368,9 @@ Phase 5 will measure the threshold/quality tradeoff before claiming savings.
 - **Honest usage accounting.** Token counts come from successful provider
   responses; missing or malformed counts cause an upstream error. Failed calls
   record zero because usage is unknown, so totals cannot capture partial upstream
-  work. Monetary estimates use `Decimal` and a `NUMERIC(20,10)` database column.
+  work. Routing totals include every reported attempt, even rejected cheap output.
+  Unknown attempts retain budget allowances but have no invented token usage or cost.
+  Monetary estimates use `Decimal` and a `NUMERIC(20,10)` database column.
   One input/output price pair is supported; per-model prices arrive with evaluation.
 
 ## Tests and verification
@@ -387,6 +465,26 @@ Face's symlink capability probe to accommodate this Windows sandbox's temporary
 directory restriction. Production code has no such patch. The pytest suite uses
 fake embeddings and providers; it downloads no weights and requires no Ollama.
 
+Phase 4 verification on 2026-10-07 (machine-readable output in
+[`reports/phase4-verification.json`](reports/phase4-verification.json)):
+
+| Check | Actual result |
+| --- | --- |
+| Ruff lint and formatting | Passed |
+| Python 3.11.16 tests | 221 passed, 1 skipped |
+| Combined line + branch application coverage, excluding migrations | 99.38% (1089/1091 lines; 192/198 branches) |
+| Concurrent half-open circuit recovery | 40 callers: 1 probe admitted, 39 rejected |
+| Parallel fallback requests at RPM capacity 3 | 12 requests: 3 served, 9 rate-limited; 6 upstream calls total |
+| Parallel worst-case route budget reservations | 12 requests: 1 admitted, 11 budget-rejected while inference remained in flight |
+| PostgreSQL migration SQL | Upgrade through 0004 and downgrade generation passed |
+| Live PostgreSQL + pgvector test | Skipped: no database supplied |
+| Docker startup / live Ollama inference | Not run: executables unavailable on the build machine |
+
+Routing tests use scripted providers and controlled clocks/delays. They verify
+decision logic and accounting, not model quality, production throughput, or latency
+savings. The stored model, provider, tier, reason, and attempt count are checked
+through fake-provider API integration tests. No Phase 4 benchmark numbers are claimed.
+
 ## Evaluation results
 
 Pending Phase 5. No latency, quality, cache-hit, routing, or cost-savings benchmark
@@ -394,9 +492,9 @@ numbers are claimed. That phase will add the dataset, repeated seeded runs,
 baseline comparisons, and a cache-threshold sweep; only actual harness outputs
 will populate the results table.
 
-## Phase 3 review
+## Phase 4 review
 
-Review the zero-new-inference usage convention, context matching and long-prompt
-guard, default one-hour TTL and 0.92 threshold, and opt-in sharing policy. Also
-review the retained-hold policy and possible duplicate inference on concurrent
-cold misses. The next milestone is routing and fallback. Work pauses here until `next`.
+Review the two model sizes/deadlines in YAML, the short-answer/refusal heuristics,
+conservative worst-case route budget holds, and the per-process circuit scope.
+Cached answers retain serving-model provenance; reported usage includes all
+completed attempts. The next milestone is evaluation. Work pauses here until `next`.

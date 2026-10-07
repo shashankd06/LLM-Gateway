@@ -40,7 +40,8 @@ def test_postgres_migration_offline_sql(monkeypatch: pytest.MonkeyPatch) -> None
     assert "FOREIGN KEY(api_key_id) REFERENCES api_keys" in ddl
     assert "CREATE TABLE cache_entries" in ddl
     assert "embedding VECTOR(384)" in ddl
-    command.downgrade(config, "0003:base", sql=True)
+    assert "ck_request_attempts_nonnegative" in ddl
+    command.downgrade(config, "0004:base", sql=True)
     rollback = output.getvalue()
     assert "DROP TABLE request_logs" in rollback
     assert "DROP EXTENSION" not in rollback
@@ -77,7 +78,11 @@ async def test_real_postgres_migration_and_proxy(monkeypatch: pytest.MonkeyPatch
             )
         app = create_app(
             Settings(
-                _env_file=None, database_url=url, admin_api_key=ADMIN_KEY, cache_enabled=False
+                _env_file=None,
+                database_url=url,
+                admin_api_key=ADMIN_KEY,
+                cache_enabled=False,
+                routing_enabled=False,
             ),
             provider=FakeProvider(),
             engine=engine,
@@ -126,7 +131,11 @@ async def test_real_postgres_migration_and_proxy(monkeypatch: pytest.MonkeyPatch
         fake = FakeProvider()
         cached_app = create_app(
             Settings(
-                _env_file=None, database_url=url, admin_api_key=ADMIN_KEY, cache_ttl_seconds=2
+                _env_file=None,
+                database_url=url,
+                admin_api_key=ADMIN_KEY,
+                cache_ttl_seconds=2,
+                routing_enabled=False,
             ),
             provider=fake,
             engine=engine,

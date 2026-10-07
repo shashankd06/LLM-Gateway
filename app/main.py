@@ -24,6 +24,8 @@ from app.providers.base import ProviderAdapter
 from app.providers.ollama import OllamaAdapter
 from app.providers.openai_compat import OpenAICompatibleAdapter
 from app.ratelimit.service import DatabaseRateLimiter
+from app.routing.config import RoutingConfig, load_routing_config
+from app.routing.router import ModelRouter
 
 
 def build_provider(settings: Settings, client: httpx.AsyncClient) -> ProviderAdapter:
@@ -102,9 +104,25 @@ def create_app(
     provider: ProviderAdapter | None = None,
     engine: AsyncEngine | None = None,
     embedder: Embedder | None = None,
+    providers: dict[str, ProviderAdapter] | None = None,
+    routing_config: RoutingConfig | None = None,
 ) -> FastAPI:
     """Inject infrastructure in tests; production owns it for the lifetime of the process."""
     config = settings or Settings()
+    routing = routing_config or (
+        load_routing_config(config.routing_config_path)
+        if config.routing_enabled
+        else RoutingConfig()
+    )
+    if (
+        config.routing_enabled
+        and not config.openai_compat_enabled
+        and any(
+            tier.provider == "openai_compat" for tier in (routing.tiers.cheap, routing.tiers.strong)
+        )
+    ):
+        if providers is None or "openai_compat" not in providers:
+            raise ValueError("Enable OPENAI_COMPAT_ENABLED before routing to openai_compat")
     db_engine = (
         engine if engine is not None else make_engine(config.database_url.get_secret_value())
     )
@@ -122,6 +140,22 @@ def create_app(
                 app.state.provider = (
                     provider if provider is not None else build_provider(config, client)
                 )
+                registry = dict(providers or {})
+                registry.setdefault(config.default_provider, app.state.provider)
+                if config.routing_enabled:
+                    required = {routing.tiers.cheap.provider, routing.tiers.strong.provider}
+                    for name in required - registry.keys():
+                        # Each adapter shares the client's connection pool, not its circuit state.
+                        selected = config.model_copy(update={"default_provider": name})
+                        registry[name] = build_provider(selected, client)
+                app.state.model_router = ModelRouter(
+                    routing,
+                    registry,
+                    config.default_provider,
+                    config.default_model,
+                    config.routing_enabled,
+                    config.provider_timeout_seconds,
+                )
                 yield
         finally:
             if embedder is None:
@@ -134,6 +168,22 @@ def create_app(
     app.state.settings = config
     app.state.session_factory = make_session_factory(db_engine)
     app.state.rate_limiter = DatabaseRateLimiter(app.state.session_factory)
+    if provider is not None:
+        # Direct unit calls need infrastructure without invoking the ASGI lifespan.
+        registry = dict(providers or {})
+        registry.setdefault(config.default_provider, provider)
+        if (
+            not config.routing_enabled
+            or {routing.tiers.cheap.provider, routing.tiers.strong.provider} <= registry.keys()
+        ):
+            app.state.model_router = ModelRouter(
+                routing,
+                registry,
+                config.default_provider,
+                config.default_model,
+                config.routing_enabled,
+                config.provider_timeout_seconds,
+            )
 
     @app.middleware("http")
     async def start_timer(

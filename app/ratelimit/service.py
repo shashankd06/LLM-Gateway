@@ -99,13 +99,20 @@ class DatabaseRateLimiter:
             stored.budget_day, stored.budget_tokens = now.date(), reserved_tokens
             log.budget_day, log.budget_tokens = stored.budget_day, stored.budget_tokens
 
-    async def settle(self, outcome: RequestLog, usage_known: bool) -> bool:
+    async def settle(
+        self,
+        outcome: RequestLog,
+        usage_known: bool,
+        charged_tokens: int | None = None,
+    ) -> bool:
         """Replace a hold exactly once, atomically with the final request log.
 
         Failed/crashed calls retain the hold because providers may have done unreported work.
         Day-specific rows ensure that late completions cannot debit a new day's budget.
         """
         assert outcome.api_key_id is not None
+        if charged_tokens is not None and charged_tokens < 0:
+            raise ValueError("charged_tokens must be nonnegative")
         async with self.sessions() as session, session.begin():
             key = await self.lock_key(session, outcome.api_key_id, require_active=False)
             stored = await session.get(RequestLog, outcome.id)
@@ -121,11 +128,17 @@ class DatabaseRateLimiter:
                 if usage_known
                 else stored.budget_tokens
             )
+            if charged_tokens is not None:
+                # Routing combines reported tokens with retained allowances for unknown attempts.
+                charge = charged_tokens
             usage.tokens_charged += charge - stored.budget_tokens
             stored.budget_tokens = charge
             stored.input_tokens, stored.output_tokens = outcome.input_tokens, outcome.output_tokens
             stored.latency_ms, stored.estimated_cost = outcome.latency_ms, outcome.estimated_cost
             stored.cache_status = outcome.cache_status
+            stored.model, stored.provider = outcome.model, outcome.provider
+            stored.tier, stored.escalation_reason = outcome.tier, outcome.escalation_reason
+            stored.attempts = outcome.attempts or 0
             stored.status, stored.http_status = outcome.status, outcome.http_status
             within_budget = charge == 0 or usage.tokens_charged <= key.daily_token_budget
             if not within_budget:

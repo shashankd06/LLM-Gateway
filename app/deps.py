@@ -10,6 +10,7 @@ from app.config import Settings
 from app.db.models import ApiKey
 from app.providers.base import ProviderAdapter
 from app.ratelimit.service import DatabaseRateLimiter
+from app.routing.router import ModelRouter
 
 
 def get_settings(request: Request) -> Settings:
@@ -33,9 +34,14 @@ def get_cache(request: Request) -> SemanticCache:
     return cast(SemanticCache, request.app.state.cache)
 
 
+def get_router(request: Request) -> ModelRouter:
+    return cast(ModelRouter, request.app.state.model_router)
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 ProviderDep = Annotated[ProviderAdapter, Depends(get_provider)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 ApiKeyDep = Annotated[ApiKey, Depends(require_api_key)]
 RateLimiterDep = Annotated[DatabaseRateLimiter, Depends(get_rate_limiter)]
 CacheDep = Annotated[SemanticCache, Depends(get_cache)]
+RouterDep = Annotated[ModelRouter, Depends(get_router)]

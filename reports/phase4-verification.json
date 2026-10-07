@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-07",
+  "phase": 4,
+  "python": "3.11.16",
+  "tests": {
+    "passed": 221,
+    "skipped": 1,
+    "failed": 0,
+    "errors": 0
+  },
+  "coverage": {
+    "combined_percent": 99.38,
+    "lines_covered": 1089,
+    "lines_valid": 1091,
+    "branches_covered": 192,
+    "branches_valid": 198,
+    "exclusions": [
+      "app/db/migrations/*"
+    ],
+    "tracing": [
+      "thread",
+      "greenlet"
+    ]
+  },
+  "routing": {
+    "default": "cheap then strong",
+    "attempts_per_tier": 2,
+    "retry": "bounded exponential backoff with full jitter",
+    "circuit": "per-provider, per-process; single half-open probe",
+    "cache": "actual model/provider/tier; route policy included in namespace",
+    "accounting": "all reported attempts plus unknown per-attempt allowances"
+  },
+  "concurrency": {
+    "circuit_callers": 40,
+    "recovery_probes_admitted": 1,
+    "circuit_rejected": 39,
+    "rpm_parallel_requests": 12,
+    "rpm_capacity": 3,
+    "served": 3,
+    "rate_limited": 9,
+    "upstream_calls": 6,
+    "budget_parallel_requests": 12,
+    "inference_admitted": 1,
+    "budget_rejected": 11,
+    "backend": "SQLite independent connections for API accounting; fake providers",
+    "evidence": "passing assertions in tests/test_routing.py and tests/test_routing_api.py"
+  },
+  "ruff_lint": "passed",
+  "ruff_format": "passed",
+  "migration_sql": "passed: upgrade 0001 through 0004 and downgrade to base",
+  "live_postgres": "skipped: TEST_DATABASE_URL not supplied",
+  "docker_startup": "not run: Docker unavailable",
+  "live_ollama": "not run: Ollama unavailable",
+  "benchmark_results": null,
+  "review_points": [
+    "YAML model sizes and per-attempt deadlines",
+    "Simple confidence heuristics can escalate correct short answers",
+    "Worst-case budget reservation can reject requests that might have fit one call",
+    "Provider circuits are shared by tiers but not across gateway processes"
+  ]
+}

@@ -141,6 +141,7 @@ python-dotenv==1.2.4
 pyyaml==6.0.3
     # via
     #   huggingface-hub
+    #   llm-gateway
     #   transformers
     #   uvicorn
 regex==2026.9.29

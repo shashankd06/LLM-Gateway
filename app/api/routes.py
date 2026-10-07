@@ -20,12 +20,23 @@ from app.api.schemas import (
 )
 from app.auth.keys import require_admin
 from app.cache.semantic_cache import CacheLookup
+from app.config import Settings
 from app.db.models import RequestLog
-from app.deps import ApiKeyDep, CacheDep, ProviderDep, RateLimiterDep, SessionDep, SettingsDep
+from app.deps import (
+    ApiKeyDep,
+    CacheDep,
+    ProviderDep,
+    RateLimiterDep,
+    RouterDep,
+    SessionDep,
+    SettingsDep,
+)
 from app.errors import GatewayError
 from app.metrics.tracking import estimate_cost
 from app.providers.base import ProviderError, ProviderTimeout
 from app.ratelimit.token_bucket import until_midnight
+from app.routing.circuit_breaker import CircuitOpen
+from app.routing.router import ModelRouter, RouteTrace
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -44,6 +55,18 @@ def error_response(status_code: int, message: str, code: str) -> JSONResponse:
     )
 
 
+def record_trace(
+    log: RequestLog, trace: RouteTrace, router: ModelRouter, settings: Settings
+) -> None:
+    if trace.target is not None:
+        log.model = trace.target.model
+        log.provider = router.providers[trace.target.provider].name
+        log.tier = trace.target.tier
+    log.attempts, log.escalation_reason = trace.attempts, trace.escalation_reason
+    log.input_tokens, log.output_tokens = trace.input_tokens, trace.output_tokens
+    log.estimated_cost = estimate_cost(trace.input_tokens, trace.output_tokens, settings)
+
+
 @router.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     body: ChatCompletionRequest,
@@ -54,8 +77,11 @@ async def chat_completions(
     key: ApiKeyDep,
     limiter: RateLimiterDep,
     cache: CacheDep,
+    model_router: RouterDep,
 ) -> ChatCompletionResponse | JSONResponse:
-    model = body.model or settings.default_model
+    plan = model_router.plan(body.model)
+    first_target = plan.targets[0]
+    model = first_target.model
     messages = [message.model_dump() for message in body.messages]
     # The prompt-based adapter contract preserves text history but not native chat-role semantics.
     prompt = "\n\n".join(f"[{message.role}]\n{message.content}" for message in body.messages)
@@ -65,14 +91,17 @@ async def chat_completions(
     if params.max_tokens > settings.max_output_tokens:
         raise GatewayError(400, "max_tokens exceeds the gateway limit", "invalid_request_error")
     # Byte count + template padding errs high for common tokenizers; actual usage is reconciled.
-    reserved_tokens = (
+    attempt_allowance = (
         len(prompt.encode("utf-8")) + settings.budget_input_token_padding + params.max_tokens
     )
+    reserved_tokens = attempt_allowance * plan.max_attempts * len(plan.targets)
     log = RequestLog(
         id=uuid4(),
         api_key_id=key.id,
         model=model,
-        provider=provider.name,
+        provider=model_router.providers[first_target.provider].name,
+        tier=first_target.tier,
+        attempts=0,
         prompt_hash=prompt_hash(messages),
         input_tokens=0,
         output_tokens=0,
@@ -89,31 +118,47 @@ async def chat_completions(
     failure: JSONResponse | None = None
     result = None
     lookup = CacheLookup(None, None)
-    query = None
-    inference_started = False
+    queries = []
+    trace = RouteTrace()
     try:
         if use_cache:
-            query = cache.query(key.id, provider.name, model, params, messages)
+            queries = [
+                cache.query(
+                    key.id,
+                    model_router.providers[target.provider].name,
+                    target.model,
+                    params,
+                    messages,
+                    plan.policy,
+                )
+                for target in reversed(plan.targets)
+            ]
             try:
-                lookup = await cache.lookup(query, prompt)
+                lookup = (
+                    await cache.lookup(queries[0], prompt)
+                    if len(queries) == 1
+                    else await cache.lookup_many(queries, prompt)
+                )
                 log.cache_status = "hit" if lookup.response is not None else "miss"
             except Exception:
                 # Cache outages degrade to inference; audit and quota storage still fail closed.
                 logger.warning("Cache lookup unavailable; bypassing cache")
                 use_cache = False
             result = lookup.response
+            if result is not None:
+                log.model, log.provider = lookup.model or model, lookup.provider or log.provider
+                log.tier = lookup.tier or first_target.tier
             if result is None:
                 await limiter.reserve(log, reserved_tokens)
         if result is None:
-            inference_started = True
-            result = await provider.generate(prompt, model, params)
-            log.input_tokens = result.input_tokens
-            log.output_tokens = result.output_tokens
-            log.estimated_cost = estimate_cost(result.input_tokens, result.output_tokens, settings)
+            result = await model_router.generate(plan, prompt, params, trace, attempt_allowance)
     except asyncio.CancelledError:
         log.status, log.http_status = "cancelled", 499
+        record_trace(log, trace, model_router, settings)
         log.latency_ms = (perf_counter() - request.state.started) * 1000
-        await asyncio.shield(limiter.settle(log, usage_known=not inference_started))
+        await asyncio.shield(
+            limiter.settle(log, usage_known=True, charged_tokens=trace.budget_charge)
+        )
         raise
     except GatewayError as exc:
         # Budget denial after a miss must finalize the existing log, not create a second row.
@@ -126,6 +171,10 @@ async def chat_completions(
     except SQLAlchemyError:
         # Quota/audit failures must never allow an unaccounted provider call.
         raise
+    except CircuitOpen as exc:
+        log.status, log.http_status = "provider_circuit_open", 503
+        failure = error_response(503, "Provider circuit is open", "provider_circuit_open")
+        failure.headers["Retry-After"] = str(exc.retry_after)
     except ProviderTimeout:
         log.status, log.http_status = "provider_timeout", 504
         failure = error_response(504, "Provider timed out", "provider_timeout")
@@ -140,10 +189,9 @@ async def chat_completions(
         failure = error_response(500, "An internal provider error occurred", "internal_error")
 
     # Gateway latency includes preparation + upstream I/O, measured before committing the audit row.
+    record_trace(log, trace, model_router, settings)
     log.latency_ms = (perf_counter() - request.state.started) * 1000
-    within_budget = await limiter.settle(
-        log, usage_known=result is not None or not inference_started
-    )
+    within_budget = await limiter.settle(log, usage_known=True, charged_tokens=trace.budget_charge)
     if not within_budget:
         failure = error_response(
             429, "Provider usage exceeded the budget reservation", "daily_budget_exceeded"
@@ -157,26 +205,34 @@ async def chat_completions(
         return failure
     assert result is not None
     if use_cache and log.cache_status == "miss":
-        assert query is not None
+        query = next(
+            query
+            for query in queries
+            if query.model == log.model and query.provider == log.provider
+        )
         try:
-            await cache.store(query, result, lookup.embedding)
+            await cache.store(query, result, lookup.embedding, log.tier or "direct")
         except Exception:
             logger.warning("Cache write unavailable; response was served without storage")
     response.headers["X-Request-ID"] = str(log.id)
     response.headers["X-Cache"] = log.cache_status.upper()
+    response.headers["X-Tier"] = log.tier or "direct"
+    response.headers["X-Provider-Attempts"] = str(log.attempts)
+    if log.escalation_reason is not None:
+        response.headers["X-Escalation-Reason"] = log.escalation_reason
     return ChatCompletionResponse(
         id=f"chatcmpl-{log.id}",
         created=int(time()),
-        model=model,
+        model=log.model,
         choices=[
             Choice(
                 message=AssistantMessage(content=result.text), finish_reason=result.finish_reason
             )
         ],
         usage=Usage(
-            prompt_tokens=result.input_tokens,
-            completion_tokens=result.output_tokens,
-            total_tokens=result.input_tokens + result.output_tokens,
+            prompt_tokens=log.input_tokens,
+            completion_tokens=log.output_tokens,
+            total_tokens=log.input_tokens + log.output_tokens,
         ),
     )
 

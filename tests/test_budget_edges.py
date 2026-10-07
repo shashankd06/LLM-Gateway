@@ -44,6 +44,7 @@ async def test_cancelled_provider_keeps_budget_charge_and_logs_outcome(
             api_key,
             app.state.rate_limiter,
             None,  # Disabled cache: this direct cancellation test never accesses it.
+            app.state.model_router,
         )
     async with make_session_factory(engine)() as session:
         log = (await session.scalars(select(RequestLog))).one()
