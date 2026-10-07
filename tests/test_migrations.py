@@ -15,6 +15,7 @@ from app.db.session import make_engine, make_session_factory
 from app.main import create_app
 from app.ratelimit.service import DatabaseRateLimiter
 from tests.conftest import ADMIN_HEADERS, ADMIN_KEY, Clock, FakeProvider
+from tests.test_cache import CHAT, NEAR, FakeEmbedder
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -37,11 +38,14 @@ def test_postgres_migration_offline_sql(monkeypatch: pytest.MonkeyPatch) -> None
     assert "CREATE TABLE api_keys" in ddl
     assert "CREATE TABLE daily_usage" in ddl
     assert "FOREIGN KEY(api_key_id) REFERENCES api_keys" in ddl
-    command.downgrade(config, "0002:base", sql=True)
+    assert "CREATE TABLE cache_entries" in ddl
+    assert "embedding VECTOR(384)" in ddl
+    command.downgrade(config, "0003:base", sql=True)
     rollback = output.getvalue()
     assert "DROP TABLE request_logs" in rollback
     assert "DROP EXTENSION" not in rollback
     assert "DROP TABLE api_keys" in rollback
+    assert "DROP TABLE cache_entries" in rollback
 
 
 @pytest.mark.postgres
@@ -72,7 +76,9 @@ async def test_real_postgres_migration_and_proxy(monkeypatch: pytest.MonkeyPatch
                 == "vector"
             )
         app = create_app(
-            Settings(_env_file=None, database_url=url, admin_api_key=ADMIN_KEY),
+            Settings(
+                _env_file=None, database_url=url, admin_api_key=ADMIN_KEY, cache_enabled=False
+            ),
             provider=FakeProvider(),
             engine=engine,
         )
@@ -116,5 +122,34 @@ async def test_real_postgres_migration_and_proxy(monkeypatch: pytest.MonkeyPatch
             logs = list((await session.scalars(select(RequestLog))).all())
             assert len(logs) == 40
             assert sum(log.status == "success" for log in logs) == 5
+        # Exercise the actual pgvector operator and driver serialization, without Ollama or weights.
+        fake = FakeProvider()
+        cached_app = create_app(
+            Settings(
+                _env_file=None, database_url=url, admin_api_key=ADMIN_KEY, cache_ttl_seconds=2
+            ),
+            provider=fake,
+            engine=engine,
+            embedder=FakeEmbedder(),
+        )
+        cached_app.state.rate_limiter = DatabaseRateLimiter(cached_app.state.session_factory, clock)
+        async with cached_app.router.lifespan_context(cached_app):
+            cached_app.state.cache.clock = clock
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=cached_app), base_url="http://test"
+            ) as client:
+                created = await client.post(
+                    "/admin/keys", headers=ADMIN_HEADERS, json={"name": "pgvector-test"}
+                )
+                headers = {"Authorization": f"Bearer {created.json()['api_key']}"}
+                miss = await client.post("/v1/chat/completions", headers=headers, json=CHAT)
+                exact = await client.post("/v1/chat/completions", headers=headers, json=CHAT)
+                semantic = await client.post("/v1/chat/completions", headers=headers, json=NEAR)
+                assert miss.headers["X-Cache"] == "MISS"
+                assert exact.headers["X-Cache"] == semantic.headers["X-Cache"] == "HIT"
+                assert len(fake.calls) == 1
+                clock.advance(2)
+                expired = await client.post("/v1/chat/completions", headers=headers, json=CHAT)
+                assert expired.headers["X-Cache"] == "MISS" and len(fake.calls) == 2
     finally:
         await engine.dispose()

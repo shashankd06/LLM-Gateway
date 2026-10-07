@@ -5,6 +5,7 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.keys import require_api_key
+from app.cache.semantic_cache import SemanticCache
 from app.config import Settings
 from app.db.models import ApiKey
 from app.providers.base import ProviderAdapter
@@ -28,8 +29,13 @@ def get_rate_limiter(request: Request) -> DatabaseRateLimiter:
     return cast(DatabaseRateLimiter, request.app.state.rate_limiter)
 
 
+def get_cache(request: Request) -> SemanticCache:
+    return cast(SemanticCache, request.app.state.cache)
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 ProviderDep = Annotated[ProviderAdapter, Depends(get_provider)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 ApiKeyDep = Annotated[ApiKey, Depends(require_api_key)]
 RateLimiterDep = Annotated[DatabaseRateLimiter, Depends(get_rate_limiter)]
+CacheDep = Annotated[SemanticCache, Depends(get_cache)]

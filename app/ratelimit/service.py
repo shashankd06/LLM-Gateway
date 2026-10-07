@@ -43,8 +43,8 @@ class DatabaseRateLimiter:
     async def admit(self, log: RequestLog, reserved_tokens: int) -> None:
         """Commit the rate debit, budget hold, and pending log in one short transaction."""
         assert log.api_key_id is not None
-        if reserved_tokens <= 0:
-            raise ValueError("reserved_tokens must be positive")
+        if reserved_tokens < 0:
+            raise ValueError("reserved_tokens must be nonnegative")
         async with self.sessions() as session, session.begin():
             key = await self.lock_key(session, log.api_key_id)
             now = await self.now(session)
@@ -57,7 +57,7 @@ class DatabaseRateLimiter:
                 )
             usage = await session.get(DailyUsage, (key.id, now.date()))
             charged = usage.tokens_charged if usage is not None else 0
-            if charged + reserved_tokens > key.daily_token_budget:
+            if reserved_tokens and charged + reserved_tokens > key.daily_token_budget:
                 raise GatewayError(
                     429, "Daily token budget exceeded", "daily_budget_exceeded", until_midnight(now)
                 )
@@ -70,6 +70,34 @@ class DatabaseRateLimiter:
             log.budget_day, log.budget_tokens = now.date(), reserved_tokens
             log.status = "in_progress"
             session.add(log)
+
+    async def reserve(self, log: RequestLog, reserved_tokens: int) -> None:
+        """After a cache miss, atomically hold tokens before starting any inference.
+
+        Cache lookup has already consumed one RPM allowance but no inference budget.
+        Locking the key still serializes competing misses across processes.
+        """
+        assert log.api_key_id is not None
+        if reserved_tokens <= 0:
+            raise ValueError("reserved_tokens must be positive")
+        async with self.sessions() as session, session.begin():
+            key = await self.lock_key(session, log.api_key_id)
+            stored = await session.get(RequestLog, log.id)
+            if stored is None or stored.status != "in_progress" or stored.budget_tokens != 0:
+                raise RuntimeError("A pending request without a hold is required")
+            now = await self.now(session)
+            usage = await session.get(DailyUsage, (key.id, now.date()))
+            charged = usage.tokens_charged if usage is not None else 0
+            if charged + reserved_tokens > key.daily_token_budget:
+                raise GatewayError(
+                    429, "Daily token budget exceeded", "daily_budget_exceeded", until_midnight(now)
+                )
+            if usage is None:
+                usage = DailyUsage(api_key_id=key.id, day=now.date(), tokens_charged=0)
+                session.add(usage)
+            usage.tokens_charged += reserved_tokens
+            stored.budget_day, stored.budget_tokens = now.date(), reserved_tokens
+            log.budget_day, log.budget_tokens = stored.budget_day, stored.budget_tokens
 
     async def settle(self, outcome: RequestLog, usage_known: bool) -> bool:
         """Replace a hold exactly once, atomically with the final request log.
@@ -97,8 +125,9 @@ class DatabaseRateLimiter:
             stored.budget_tokens = charge
             stored.input_tokens, stored.output_tokens = outcome.input_tokens, outcome.output_tokens
             stored.latency_ms, stored.estimated_cost = outcome.latency_ms, outcome.estimated_cost
+            stored.cache_status = outcome.cache_status
             stored.status, stored.http_status = outcome.status, outcome.http_status
-            within_budget = usage.tokens_charged <= key.daily_token_budget
+            within_budget = charge == 0 or usage.tokens_charged <= key.daily_token_budget
             if not within_budget:
                 # An opaque provider tokenizer can exceed the conservative input estimate.
                 # Charge all reported usage honestly, reject the response, and block further calls.

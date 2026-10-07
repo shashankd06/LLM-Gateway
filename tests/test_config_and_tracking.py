@@ -32,6 +32,10 @@ def test_default_local_configuration() -> None:
         {"admin_api_key": "short"},
         {"admin_api_key": "replace-with-at-least-32-random-characters"},
         {"default_max_output_tokens": 10, "max_output_tokens": 5},
+        {"cache_similarity_threshold": -0.01},
+        {"cache_similarity_threshold": 1.01},
+        {"cache_similarity_threshold": float("nan")},
+        {"cache_ttl_seconds": 0},
     ],
 )
 def test_configuration_rejects_invalid_settings(overrides: dict[str, object]) -> None:

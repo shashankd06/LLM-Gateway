@@ -1,0 +1,61 @@
+{
+  "date": "2026-10-07",
+  "phase": 3,
+  "python": "3.11.16",
+  "tests": {
+    "passed": 156,
+    "skipped": 1,
+    "failed": 0,
+    "errors": 0
+  },
+  "coverage": {
+    "combined_percent": 99.89,
+    "lines_covered": 784,
+    "lines_valid": 784,
+    "branches_covered": 111,
+    "branches_valid": 112,
+    "exclusions": [
+      "app/db/migrations/*"
+    ],
+    "tracing": [
+      "thread",
+      "greenlet"
+    ]
+  },
+  "cache_concurrency": {
+    "backend": "SQLite, independent connections; not live PostgreSQL",
+    "clock": "fixed",
+    "cached_parallel_requests": 40,
+    "rpm_capacity": 5,
+    "hits_served": 5,
+    "rate_limited": 35,
+    "cold_miss_parallel_requests": 12,
+    "inference_admitted": 1,
+    "budget_rejected": 11,
+    "evidence": "passing assertions in tests/test_cache.py"
+  },
+  "real_embedding_smoke": {
+    "model": "sentence-transformers/all-MiniLM-L6-v2",
+    "device": "cpu",
+    "dimensions": 384,
+    "paraphrase_similarity": 0.8786828486307642,
+    "unrelated_similarity": 0.10482967426852154,
+    "long_prompt_semantic_lookup": "skipped to prevent truncation",
+    "purpose": "embedding smoke check, not an eval benchmark",
+    "environment_note": "HF symlink capability probe disabled only in this smoke script; Windows sandbox rejects mode-700 temporary directories"
+  },
+  "ruff_lint": "passed",
+  "ruff_format": "passed",
+  "migration_sql": "passed: upgrades 0001+0002+0003 and downgrade to base",
+  "live_postgres": "skipped: TEST_DATABASE_URL not supplied",
+  "docker_startup": "not run: Docker unavailable",
+  "live_ollama": "not run: Ollama unavailable",
+  "benchmark_results": null,
+  "review_points": [
+    "Cache hits report zero new inference usage and consume RPM only",
+    "Exact context match and no semantic matching of truncated prompts",
+    "Default TTL 3600 seconds and similarity threshold 0.92; quality not benchmarked",
+    "Cross-key sharing opt-in; cached responses and embeddings may be sensitive",
+    "Concurrent cold misses can perform duplicate inference but have one upserted entry"
+  ]
+}

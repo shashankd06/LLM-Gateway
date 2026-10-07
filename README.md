@@ -5,31 +5,36 @@ accounting, caching, routing, and failure handling individually. This project pu
 those responsibilities behind a small OpenAI-style API and measures their effect
 on latency, hypothetical cost, and answer quality.
 
-**Current milestone: Phase 2 — API keys, request limits, and daily token budgets.**
-The core proxy and logging are complete. Semantic caching, routing and fallback,
-the evaluation harness, and the dashboard follow in later phases. No model
-benchmark results exist yet.
+**Current milestone: Phase 3 — exact and semantic caching.** The core proxy,
+hashed API keys, concurrent rate limits, daily budgets, and semantic cache are
+implemented. Routing, evaluation, and the dashboard follow in later phases.
+No end-to-end model benchmark results exist yet.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     Client[Client application + bearer key] --> API[FastAPI: authenticate and validate]
-    API --> Limits[Atomic rate debit + budget reservation]
-    Limits --> Adapter[ProviderAdapter]
+    API --> Limits[Atomic rate debit + pending audit row]
+    Limits --> Cache[Exact hash then semantic cache]
+    Cache --> Embed[MiniLM CPU worker]
+    Cache --> DB[(PostgreSQL 16 + pgvector)]
+    Cache -- hit --> Logs[Settle reported usage + request outcome]
+    Cache -- miss or bypass --> Budget[Atomic inference budget reservation]
+    Budget --> Adapter[ProviderAdapter]
     Adapter --> Ollama[Host Ollama: default]
     Adapter -. explicitly enabled .-> Compatible[OpenAI-style endpoint]
     Limits --> DB[(PostgreSQL 16 + pgvector)]
-    API --> Logs[Settle reported usage + request outcome]
+    Adapter --> Logs
     Logs --> DB[(PostgreSQL 16 + pgvector)]
     Admin[Admin bearer key] --> Keys[POST /admin/keys]
     Keys --> DB
-    API --> Reply[Completion or sanitized error]
+    Logs --> Reply[Completion or sanitized error]
 ```
 
 The gateway and database run in Compose. Ollama runs on the host. Model inference
 uses local resources and requires no paid API key. `pgvector` is installed by the
-first migration; embeddings and vector queries arrive in Phase 3.
+first migration. The third migration adds a cache table with `vector(384)` embeddings.
 
 ## Start locally
 
@@ -71,6 +76,13 @@ Compose waits for PostgreSQL readiness, applies Alembic migrations, and starts t
 gateway. The gateway binds to host loopback at port 8000. Open
 [interactive API docs](http://localhost:8000/docs).
 
+The first semantic-cache request downloads the public MiniLM model from Hugging
+Face without a token or paid API key. CPU PyTorch wheels are pinned; CUDA is not
+required. Model files persist in Compose's `embedding_models` volume. This first
+request has cold-start overhead; subsequent requests use local files. Set
+`CACHE_ENABLED=false` for a proxy that never initializes the embedder. `/health`
+checks the database and provider, not whether embedding weights have been loaded.
+
 Create a client key using the admin credential from `.env` (use `curl.exe` in
 Windows PowerShell):
 
@@ -109,7 +121,8 @@ the configured maximum of 4096 are rejected before inference. In `/docs`, use
 **Authorize** with the raw admin or client key appropriate for the endpoint.
 
 Successful completions and provider failures include `X-Request-ID` matching the
-database row and `X-Cache: BYPASS`. There is no cache in this phase. Provider
+database row and `X-Cache: HIT`, `MISS`, or `BYPASS`. Add `"cache": false` to a chat
+request to skip both cache reads and writes. Provider
 timeouts return 504, other upstream failures return 502, unexpected adapter errors
 return 500, and database logging failures return 503. No retry or fallback runs yet.
 
@@ -140,6 +153,11 @@ taking precedence. See `.env.example` for the minimal local setup.
 | `DEFAULT_MAX_OUTPUT_TOKENS` | 512 when the request omits `max_tokens` |
 | `MAX_OUTPUT_TOKENS` | 4096 maximum accepted output allowance |
 | `BUDGET_INPUT_TOKEN_PADDING` | 256 additional tokens reserved for provider prompt templates |
+| `CACHE_ENABLED` | `true`; globally enables exact and semantic lookup |
+| `CACHE_SIMILARITY_THRESHOLD` | `0.92`; inclusive cosine similarity threshold, between 0 and 1 |
+| `CACHE_TTL_SECONDS` | `3600`; fixed expiry from generation time, not extended by hits |
+| `CACHE_SHARE_ACROSS_KEYS` | `false`; explicitly opt in to sharing responses between keys |
+| `EMBEDDING_CACHE_DIR` | Optional model directory; Compose sets a persistent writable volume |
 
 The optional OpenAI-compatible adapter remains disabled by default. Selecting it
 requires `OPENAI_COMPAT_ENABLED=true` and a base URL; otherwise startup fails
@@ -152,14 +170,18 @@ Every key has its own token bucket: capacity equals `requests_per_minute`, and
 tokens refill continuously at `requests_per_minute / 60` per second. It permits
 an initial burst up to capacity; it is not a strict sliding-window counter.
 Validated completion attempts debit the bucket. Provider failures consume the
-request debit, while pre-admission budget rejections do not. Malformed and
+request debit. With caching enabled, a request consumes RPM before lookup, even
+if its miss later fails the budget check. With caching bypassed, RPM and budget
+are checked together and a budget rejection consumes neither. Malformed and
 unauthenticated requests are logged without an inference debit.
 
 Admission runs inside a short PostgreSQL transaction. It locks the API-key row
 with [`SELECT ... FOR UPDATE`](https://www.postgresql.org/docs/16/explicit-locking.html#LOCKING-ROWS),
-then reads database wall-clock time, checks the bucket and daily balance, and
-commits the request debit, budget hold, and `in_progress` log together. The lock
-and connection are released before inference. All workers use the same database
+then reads database wall-clock time and commits the request debit and `in_progress`
+log. Cache lookup initially holds zero tokens. A miss reserves inference tokens
+in a second short transaction under the same key lock, before calling the
+provider. Bypassed requests reserve tokens during admission. The locks and
+connections are released before CPU embedding work and inference. All workers use the same database
 state; there is no process-local rate counter or lock.
 
 The hold reserves UTF-8 prompt bytes + template padding + maximum output tokens.
@@ -173,7 +195,8 @@ Failed calls with unknown usage retain their reservation. A process crash leaves
 an `in_progress` row and a retained hold, rather than refunding potentially consumed
 tokens. This favors budget safety over availability; no automatic same-day refund
 or recovery endpoint is implemented. Calls finishing after midnight settle their
-original day, and calls already admitted still settle if the key is later marked
+day of their inference reservation. If cache lookup crosses midnight, reservation
+uses the new day. Calls already admitted still settle if the key is later marked
 inactive.
 
 Budgets reset at **00:00 UTC (05:30 India time)** using separate per-key, per-day
@@ -182,10 +205,51 @@ rows. Daily-budget `Retry-After` points to the next UTC reset.
 An arbitrary provider's hidden tokenizer or prompt template can exceed the input
 estimate, or a provider can ignore its output allowance. If reported usage pushes
 the charged daily balance over budget, the gateway records all usage, returns
-429, and rejects further admissions while the balance exceeds the limit. Thus
+429, and rejects further inference while the balance exceeds the limit. Cache
+hits can still succeed because they consume no inference tokens. Thus
 concurrent reservations are bounded, but an exact upstream-consumption ceiling
 cannot be guaranteed for every opaque provider. Increase padding for unusual
 templates; this behavior has a dedicated overrun test.
+
+## Semantic cache behavior
+
+Lookup first matches the structured prompt hash without computing an embedding.
+On an exact miss, `sentence-transformers/all-MiniLM-L6-v2` embeds the full transcript
+in a dedicated thread executor. PostgreSQL orders candidates by pgvector cosine
+distance (`<=>`) and returns the nearest candidate meeting the configured
+threshold. Model, normalized effective generation parameters (including JSON
+mode), provider endpoint, conversation context, and unexpired TTL must all match.
+Only the final user message may vary semantically; previous turns and system
+instructions must match exactly. Changing the upstream URL changes the cache
+namespace. If you replace a model's weights under the same name, clear its cache
+or wait for TTL expiry.
+
+The [MiniLM model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)
+documents 384-dimensional embeddings and truncation beyond 256 word pieces.
+The gateway checks the actual tokenizer length and uses **exact matching only**
+for overlong prompts and conversations ending in a non-user message. This avoids
+semantic collisions caused by dropping a different suffix. Embedding errors
+bypass caching; cache read/write errors do not discard successful inference.
+Quota and audit database failures still return 503. Errors and empty answers
+are never cached.
+
+Cache hits return the saved text and finish reason with zero input/output usage,
+zero cost, and no inference budget charge. These usage fields measure **new
+inference**, not the historical token count of the saved answer. They consume
+one RPM allowance. Cache rows store response text and embeddings; they can
+contain sensitive information even though raw prompts are not stored. Each row
+always records its owning API key. Keep `CACHE_SHARE_ACROSS_KEYS=false` unless
+all clients may access each other's saved responses.
+
+Expiry is fixed from storage, with expired rows removed lazily on successful
+cache writes. Repeated concurrent misses use an upsert so one exact entry remains.
+They may still perform duplicate inference; request coalescing is not implemented.
+The vector search is exact rather than approximate. The scope index narrows
+candidates, but high-volume corpora will need measured indexing and cleanup work.
+Semantic similarity can confuse negation, numbers, or related questions requiring
+different answers; the threshold is a tuning parameter, not a correctness proof.
+Use `cache: false` for fresh stochastic output or questions requiring fresh data.
+Phase 5 will measure the threshold/quality tradeoff before claiming savings.
 
 ## Design decisions and tradeoffs
 
@@ -201,7 +265,8 @@ templates; this behavior has a dedicated overrun test.
   adapter sends that transcript as one user message. A native message-based
   contract would improve fidelity if the project later requires it.
 - **Commit before inference and responding.** Admission writes a pending row;
-  completion updates that same row. Rejections write a separate completed row.
+  completion updates that same row. Pre-admission rejections write a completed row;
+  budget rejections after cache lookup finalize the already-admitted row.
   If admission fails to commit, the rate debit and budget hold roll back and no
   provider call runs. If final accounting fails, return 503 and keep the committed
   hold. Cancellation attempts to finalize its log without refunding unknown usage.
@@ -214,14 +279,15 @@ templates; this behavior has a dedicated overrun test.
 - **No raw prompt logs.** SHA-256 hashes use canonical JSON of the ordered chat
   messages, including roles. Logs store no prompt or response text. These are
   correlation identifiers, not anonymization: low-entropy prompts can be guessed.
+  Cache response text is stored separately and has a configurable TTL.
 - **Separate async sessions.** Each request has its own SQLAlchemy session, in
   line with [SQLAlchemy's concurrency guidance](https://docs.sqlalchemy.org/en/20/orm/extensions/asyncio.html#using-asyncsession-with-concurrent-tasks).
   Requests never share mutable transaction state. Alembic owns schema changes;
   production does not call `create_all()`.
 - **Explicit measurement boundaries.** Adapters measure outbound wall-clock
   latency, including transport overhead. The persisted `latency_ms` measures the
-  gateway's time through validation, admission, and inference, before the final
-  log commit; it excludes final settlement latency and response transfer.
+  gateway's time through validation, admission, cache lookup, and inference,
+  before the final log commit; it excludes settlement, cache writes, and response transfer.
   Phase 5 will measure client-side end-to-end latency separately.
 - **Honest usage accounting.** Token counts come from successful provider
   responses; missing or malformed counts cause an upstream error. Failed calls
@@ -249,14 +315,16 @@ To refresh them with uv:
 
 ```sh
 uv lock
-uv export --no-dev --no-hashes --no-emit-project --output-file requirements.txt
-uv export --extra dev --no-dev --no-hashes --no-emit-project --output-file requirements-dev.txt
+uv export --no-dev --no-hashes --no-emit-project --emit-index-url --output-file requirements.txt
+uv export --extra dev --no-dev --no-hashes --no-emit-project --emit-index-url --output-file requirements-dev.txt
 ```
 
 The default suite covers mocked HTTP adapters, successful proxy calls, validation,
 timeout/error logging, configuration, cost accounting, health, lifecycle cleanup,
 and log-write failures, key creation/authentication, bucket refill, parallel bursts,
 budget reservations, UTC resets, cancellation, and idempotent settlement. Proxy
+tests also exercise cache scope, exact lookup, similarity thresholds, TTL,
+bypass, failures, concurrent hits and cold misses, and executor behavior. Proxy
 integration tests use independent connections to temporary SQLite databases.
 SQLite's `BEGIN IMMEDIATE` serializes writers before reading limiter state;
 production instead uses PostgreSQL row locks. These tests verify request-level
@@ -267,7 +335,8 @@ threads and SQLAlchemy's greenlet bridge, as required by
 
 The `postgres` test additionally applies the real migration to an **empty
 disposable PostgreSQL database with pgvector installed**, verifies the schema and
-extension, and exercises a 40-request fake-provider burst through PostgreSQL. Set
+extension, exercises a 40-request fake-provider burst, and checks real pgvector
+exact/semantic hits and TTL expiry with a fake embedder. Set
 `TEST_DATABASE_URL=postgresql+asyncpg://...` and run
 `python -m pytest -m postgres --no-cov`. This test leaves its data in that disposable
 database and refuses a database containing existing tables.
@@ -294,6 +363,30 @@ them after each test. The concurrency clock is frozen so refill during test
 execution cannot make the expected burst size vary. No Ollama instance or API key
 is required. CI setup arrives in Phase 6.
 
+Phase 3 verification on 2026-10-07 (machine-readable output in
+[`reports/phase3-verification.json`](reports/phase3-verification.json)):
+
+| Check | Actual result |
+| --- | --- |
+| Ruff lint and formatting | Passed |
+| Python 3.11.16 tests | 156 passed, 1 skipped |
+| Combined line + branch application coverage, excluding migrations | 99.89% (784/784 lines; 111/112 branches) |
+| Cached burst at an exhausted daily budget, fixed clock | 40 parallel requests: 5 hits served, 35 rate-limited at RPM capacity 5 |
+| Concurrent cache-miss budget reservations | 12 parallel requests: 1 admitted to inference, 11 budget-rejected |
+| PostgreSQL migration SQL | Upgrade through 0003 and downgrade generation passed |
+| Real MiniLM CPU smoke check | 384-dimensional vectors; long-prompt guard passed |
+| Live PostgreSQL + pgvector test | Skipped: no database supplied |
+| Docker startup / live Ollama inference | Not run: executables unavailable on the build machine |
+
+The separately recorded real-encoder smoke check is in
+[`reports/phase3-embedding-smoke.json`](reports/phase3-embedding-smoke.json).
+Its sample paraphrase similarity was 0.878683, below the default 0.92 threshold;
+the unrelated pair scored 0.104830. These two examples validate the encoder,
+not dataset quality or expected hit rate. The smoke script disabled only Hugging
+Face's symlink capability probe to accommodate this Windows sandbox's temporary
+directory restriction. Production code has no such patch. The pytest suite uses
+fake embeddings and providers; it downloads no weights and requires no Ollama.
+
 ## Evaluation results
 
 Pending Phase 5. No latency, quality, cache-hit, routing, or cost-savings benchmark
@@ -301,10 +394,9 @@ numbers are claimed. That phase will add the dataset, repeated seeded runs,
 baseline comparisons, and a cache-threshold sweep; only actual harness outputs
 will populate the results table.
 
-## Phase 2 review
+## Phase 3 review
 
-Review the conservative budget-reservation policy, retained holds on unknown
-usage, UTC reset time, and the provider-tokenizer overrun limitation. The admin
-credential and client key have separate purposes. The next milestone is semantic
-caching with exact-match lookup, pgvector similarity search, TTL expiry, and
-per-key isolation. Work pauses at this milestone until `next`.
+Review the zero-new-inference usage convention, context matching and long-prompt
+guard, default one-hour TTL and 0.92 threshold, and opt-in sharing policy. Also
+review the retained-hold policy and possible duplicate inference on concurrent
+cold misses. The next milestone is routing and fallback. Work pauses here until `next`.

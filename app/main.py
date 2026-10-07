@@ -13,6 +13,8 @@ from starlette.responses import Response
 
 from app.api.keys import router as keys_router
 from app.api.routes import error_response, prompt_hash, router
+from app.cache.embedder import Embedder, SentenceTransformerEmbedder
+from app.cache.semantic_cache import SemanticCache
 from app.config import Settings
 from app.db.models import RequestLog
 from app.db.session import make_engine, make_session_factory
@@ -65,6 +67,7 @@ async def rejected_completion(
         except SQLAlchemyError:
             return error_response(503, "Request logging is unavailable", "database_unavailable")
         response.headers["X-Request-ID"] = str(log.id)
+        response.headers["X-Cache"] = "BYPASS"
     return response
 
 
@@ -98,6 +101,7 @@ def create_app(
     settings: Settings | None = None,
     provider: ProviderAdapter | None = None,
     engine: AsyncEngine | None = None,
+    embedder: Embedder | None = None,
 ) -> FastAPI:
     """Inject infrastructure in tests; production owns it for the lifetime of the process."""
     config = settings or Settings()
@@ -107,6 +111,12 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        encoder = (
+            embedder
+            if embedder is not None
+            else SentenceTransformerEmbedder(config.embedding_cache_dir)
+        )
+        app.state.cache = SemanticCache(app.state.session_factory, encoder, config)
         try:
             async with httpx.AsyncClient(timeout=config.provider_timeout_seconds) as client:
                 app.state.provider = (
@@ -114,6 +124,9 @@ def create_app(
                 )
                 yield
         finally:
+            if embedder is None:
+                assert isinstance(encoder, SentenceTransformerEmbedder)
+                await encoder.close()
             if engine is None:
                 await db_engine.dispose()
 

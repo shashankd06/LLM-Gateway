@@ -23,6 +23,7 @@ class ChatCompletionRequest(GenerationOptions):
     messages: list[ChatMessage] = Field(min_length=1)
     stream: Literal[False] = False
     n: Literal[1] = 1
+    cache: bool = Field(default=True, strict=True)
     response_format: ResponseFormat = Field(default_factory=ResponseFormat)
 
     def generation_params(self) -> GenerationParams:

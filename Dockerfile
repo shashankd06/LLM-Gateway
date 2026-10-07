@@ -6,7 +6,9 @@ COPY pyproject.toml ./
 COPY requirements.txt ./
 COPY app ./app
 RUN pip install --no-cache-dir -r requirements.txt && pip install --no-cache-dir --no-deps . \
-    && useradd --create-home gateway
+    && useradd --create-home gateway \
+    && mkdir -p /home/gateway/.cache/embeddings \
+    && chown -R gateway:gateway /home/gateway/.cache
 COPY alembic.ini ./
 USER gateway
 EXPOSE 8000

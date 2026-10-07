@@ -43,6 +43,7 @@ async def test_cancelled_provider_keeps_budget_charge_and_logs_outcome(
             provider,
             api_key,
             app.state.rate_limiter,
+            None,  # Disabled cache: this direct cancellation test never accesses it.
         )
     async with make_session_factory(engine)() as session:
         log = (await session.scalars(select(RequestLog))).one()
@@ -112,7 +113,7 @@ async def test_limiter_rechecks_key_inside_admission_transaction(
 
 async def test_invalid_reservation_is_rejected(app: FastAPI, api_key: ApiKey) -> None:
     with pytest.raises(ValueError):
-        await app.state.rate_limiter.admit(RequestLog(id=uuid4(), api_key_id=api_key.id), 0)
+        await app.state.rate_limiter.admit(RequestLog(id=uuid4(), api_key_id=api_key.id), -1)
 
 
 async def test_database_time_and_postgres_lock_statement(clock: Clock) -> None:

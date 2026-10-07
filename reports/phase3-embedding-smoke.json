@@ -1,0 +1,10 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "device": "cpu",
+  "dimensions": 384,
+  "paraphrase_similarity": 0.8786828486307642,
+  "unrelated_similarity": 0.10482967426852154,
+  "long_prompt_semantic_lookup": "skipped to prevent truncation",
+  "purpose": "embedding smoke check, not an eval benchmark",
+  "environment_note": "HF symlink capability probe disabled only in this smoke script; Windows sandbox rejects mode-700 temporary directories"
+}

@@ -23,6 +23,11 @@ class Settings(BaseSettings):
     default_max_output_tokens: int = Field(default=512, gt=0)
     max_output_tokens: int = Field(default=4096, gt=0)
     budget_input_token_padding: int = Field(default=256, ge=0)
+    cache_enabled: bool = True
+    cache_similarity_threshold: float = Field(default=0.92, ge=0, le=1, allow_inf_nan=False)
+    cache_ttl_seconds: int = Field(default=3600, gt=0)
+    cache_share_across_keys: bool = False
+    embedding_cache_dir: str | None = None
 
     @model_validator(mode="after")
     def validate_provider_configuration(self) -> "Settings":

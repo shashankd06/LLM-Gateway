@@ -2,7 +2,9 @@ from datetime import date, datetime
 from decimal import Decimal
 from uuid import UUID, uuid4
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    JSON,
     BigInteger,
     CheckConstraint,
     Date,
@@ -11,6 +13,8 @@ from sqlalchemy import (
     Index,
     Numeric,
     String,
+    Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -41,6 +45,39 @@ class ApiKey(Base):
     bucket_tokens: Mapped[float]
     bucket_updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CacheEntry(Base):
+    __tablename__ = "cache_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "api_key_id",
+            "namespace",
+            "model",
+            "params_hash",
+            "prompt_hash",
+            name="uq_cache_exact",
+        ),
+        Index("ix_cache_scope", "namespace", "model", "params_hash", "context_hash", "api_key_id"),
+        Index("ix_cache_expiry", "expires_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    api_key_id: Mapped[UUID] = mapped_column(Uuid, ForeignKey("api_keys.id"))
+    # Namespace includes the endpoint and embedding implementation version, preventing stale reuse.
+    namespace: Mapped[str] = mapped_column(String(64))
+    model: Mapped[str] = mapped_column(String(200))
+    params_hash: Mapped[str] = mapped_column(String(64))
+    prompt_hash: Mapped[str] = mapped_column(String(64))
+    context_hash: Mapped[str] = mapped_column(String(64))
+    # JSON is only a test-backend variant; production always stores vector(384).
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(384).with_variant(JSON(none_as_null=True), "sqlite"), nullable=True
+    )
+    response_text: Mapped[str] = mapped_column(Text)
+    finish_reason: Mapped[str] = mapped_column(String(10))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class DailyUsage(Base):
