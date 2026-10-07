@@ -6,10 +6,10 @@ import pytest
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from app.db.models import RequestLog
+from app.db.models import ApiKey, DailyUsage, RequestLog
 from app.db.session import make_session_factory
 from app.providers.base import ProviderError, ProviderTimeout
-from tests.conftest import FakeProvider
+from tests.conftest import ADMIN_HEADERS, FakeProvider
 
 CHAT = {"messages": [{"role": "user", "content": "What is the capital of France?"}]}
 
@@ -37,7 +37,7 @@ async def test_completion_and_durable_log(
     log = logs[0]
     assert log.id == UUID(response.headers["X-Request-ID"])
     assert body["id"] == f"chatcmpl-{log.id}"
-    assert log.api_key_id is None
+    assert log.api_key_id is not None
     assert (log.model, log.provider, log.status, log.http_status) == (
         "test-model",
         "fake",
@@ -167,14 +167,14 @@ async def test_health_and_metrics(client: httpx.AsyncClient, provider: FakeProvi
         "database": True,
         "provider": {"name": "fake", "healthy": True},
     }
-    assert (await client.get("/metrics-summary")).json() == {
+    assert (await client.get("/metrics-summary", headers=ADMIN_HEADERS)).json() == {
         "requests": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "estimated_cost": 0,
     }
     await client.post("/v1/chat/completions", json=CHAT)
-    assert (await client.get("/metrics-summary")).json() == {
+    assert (await client.get("/metrics-summary", headers=ADMIN_HEADERS)).json() == {
         "requests": 1,
         "input_tokens": 12,
         "output_tokens": 3,
@@ -185,7 +185,7 @@ async def test_health_and_metrics(client: httpx.AsyncClient, provider: FakeProvi
 
 
 async def test_database_failure_never_returns_unlogged_success(
-    client: httpx.AsyncClient, engine: AsyncEngine
+    client: httpx.AsyncClient, engine: AsyncEngine, api_key: ApiKey
 ) -> None:
     async with engine.begin() as connection:
         await connection.execute(text("DROP TABLE request_logs"))
@@ -194,7 +194,12 @@ async def test_database_failure_never_returns_unlogged_success(
         assert response.status_code == 503
         assert response.json()["error"]["code"] == "database_unavailable"
         assert "request_logs" not in response.text
+    async with make_session_factory(engine)() as session:
+        key = await session.get(ApiKey, api_key.id)
+        assert key is not None and key.bucket_tokens == 60
+        assert not list((await session.scalars(select(DailyUsage))).all())
 
 
-async def test_unimplemented_api_keys_endpoint(client: httpx.AsyncClient) -> None:
-    assert (await client.post("/admin/keys")).status_code == 404
+async def test_client_key_cannot_create_keys(client: httpx.AsyncClient) -> None:
+    response = await client.post("/admin/keys", json={"name": "forbidden"})
+    assert response.status_code == 401

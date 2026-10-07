@@ -1,0 +1,51 @@
+{
+  "date": "2026-10-07",
+  "phase": 2,
+  "python": "3.11.16",
+  "tests": {
+    "passed": 104,
+    "skipped": 1,
+    "failed": 0,
+    "errors": 0
+  },
+  "coverage": {
+    "combined_percent": 100.0,
+    "lines_covered": 577,
+    "lines_valid": 577,
+    "branches_covered": 68,
+    "branches_valid": 68,
+    "exclusions": [
+      "app/db/migrations/*"
+    ],
+    "tracing": [
+      "thread",
+      "greenlet"
+    ]
+  },
+  "concurrency_test": {
+    "backend": "file SQLite, independent connections, BEGIN IMMEDIATE",
+    "clock": "fixed; no refill during burst",
+    "app_instances": 2,
+    "parallel_requests": 40,
+    "capacity": 5,
+    "successful": 5,
+    "rate_limited": 35,
+    "daily_budget_parallel_requests": 12,
+    "inflight_admitted": 1,
+    "budget_rejected": 11,
+    "evidence": "passing assertions in tests/test_rate_limits.py"
+  },
+  "ruff_lint": "passed",
+  "ruff_format": "passed",
+  "migration_sql": "passed: PostgreSQL upgrades 0001+0002 and downgrade to base",
+  "live_postgres": "skipped: TEST_DATABASE_URL not supplied",
+  "docker_startup": "not run: Docker unavailable",
+  "live_ollama": "not run",
+  "test_command": "python -m pytest -p no:cacheprovider --tb=short",
+  "benchmark_results": null,
+  "review_points": [
+    "Retain budget holds when upstream usage is unknown",
+    "UTC day reset; late completions settle original day",
+    "Opaque provider tokenizers can exceed conservative input reservation"
+  ]
+}

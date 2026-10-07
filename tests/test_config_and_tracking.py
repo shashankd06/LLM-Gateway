@@ -29,6 +29,9 @@ def test_default_local_configuration() -> None:
         {"openai_compat_enabled": True},
         {"provider_timeout_seconds": 0},
         {"input_cost_per_1k": -1},
+        {"admin_api_key": "short"},
+        {"admin_api_key": "replace-with-at-least-32-random-characters"},
+        {"default_max_output_tokens": 10, "max_output_tokens": 5},
     ],
 )
 def test_configuration_rejects_invalid_settings(overrides: dict[str, object]) -> None:

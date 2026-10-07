@@ -4,7 +4,7 @@ import json
 from time import perf_counter, time
 from uuid import uuid4
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -17,10 +17,13 @@ from app.api.schemas import (
     Choice,
     Usage,
 )
+from app.auth.keys import require_admin
 from app.db.models import RequestLog
-from app.deps import ProviderDep, SessionDep, SettingsDep
-from app.metrics.tracking import estimate_cost, save_log
+from app.deps import ApiKeyDep, ProviderDep, RateLimiterDep, SessionDep, SettingsDep
+from app.errors import GatewayError
+from app.metrics.tracking import estimate_cost
 from app.providers.base import ProviderError, ProviderTimeout
+from app.ratelimit.token_bucket import until_midnight
 
 router = APIRouter()
 
@@ -45,16 +48,25 @@ async def chat_completions(
     response: Response,
     settings: SettingsDep,
     provider: ProviderDep,
-    session: SessionDep,
+    key: ApiKeyDep,
+    limiter: RateLimiterDep,
 ) -> ChatCompletionResponse | JSONResponse:
     model = body.model or settings.default_model
     messages = [message.model_dump() for message in body.messages]
     # The prompt-based adapter contract preserves text history but not native chat-role semantics.
     prompt = "\n\n".join(f"[{message.role}]\n{message.content}" for message in body.messages)
     prompt += "\n\n[assistant]\n"
+    params = body.generation_params()
+    params.max_tokens = params.max_tokens or settings.default_max_output_tokens
+    if params.max_tokens > settings.max_output_tokens:
+        raise GatewayError(400, "max_tokens exceeds the gateway limit", "invalid_request_error")
+    # Byte count + template padding errs high for common tokenizers; actual usage is reconciled.
+    reserved_tokens = (
+        len(prompt.encode("utf-8")) + settings.budget_input_token_padding + params.max_tokens
+    )
     log = RequestLog(
         id=uuid4(),
-        api_key_id=None,
+        api_key_id=key.id,
         model=model,
         provider=provider.name,
         prompt_hash=prompt_hash(messages),
@@ -66,13 +78,20 @@ async def chat_completions(
         status="success",
         http_status=200,
     )
+    await limiter.admit(log, reserved_tokens)
+    log.status = "success"
     failure: JSONResponse | None = None
     result = None
     try:
-        result = await provider.generate(prompt, model, body.generation_params())
+        result = await provider.generate(prompt, model, params)
         log.input_tokens = result.input_tokens
         log.output_tokens = result.output_tokens
         log.estimated_cost = estimate_cost(result.input_tokens, result.output_tokens, settings)
+    except asyncio.CancelledError:
+        log.status, log.http_status = "cancelled", 499
+        log.latency_ms = (perf_counter() - request.state.started) * 1000
+        await asyncio.shield(limiter.settle(log, usage_known=False))
+        raise
     except ProviderTimeout:
         log.status, log.http_status = "provider_timeout", 504
         failure = error_response(504, "Provider timed out", "provider_timeout")
@@ -88,7 +107,14 @@ async def chat_completions(
 
     # Gateway latency includes preparation + upstream I/O, measured before committing the audit row.
     log.latency_ms = (perf_counter() - request.state.started) * 1000
-    await save_log(session, log)
+    within_budget = await limiter.settle(log, usage_known=result is not None)
+    if not within_budget:
+        failure = error_response(
+            429, "Provider usage exceeded the budget reservation", "daily_budget_exceeded"
+        )
+        # The relevant hold belongs to its original UTC day. Retry uses the next UTC reset.
+        async with limiter.sessions() as session:
+            failure.headers["Retry-After"] = str(until_midnight(await limiter.now(session)))
     if failure is not None:
         failure.headers["X-Request-ID"] = str(log.id)
         failure.headers["X-Cache"] = "BYPASS"
@@ -135,7 +161,7 @@ async def health(provider: ProviderDep, session: SessionDep) -> JSONResponse:
     )
 
 
-@router.get("/metrics-summary")
+@router.get("/metrics-summary", dependencies=[Depends(require_admin)])
 async def metrics_summary(session: SessionDep) -> dict[str, int | float]:
     row = (
         await session.execute(

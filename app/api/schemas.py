@@ -1,4 +1,5 @@
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -59,3 +60,18 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: list[Choice]
     usage: Usage
+
+
+class CreateApiKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(min_length=1, max_length=100)
+    requests_per_minute: int = Field(default=60, ge=1, le=10000, strict=True)
+    daily_token_budget: int = Field(default=100000, ge=1, le=10**12, strict=True)
+
+
+class CreatedApiKey(BaseModel):
+    id: UUID
+    name: str
+    api_key: str
+    requests_per_minute: int
+    daily_token_budget: int

@@ -1,0 +1,5 @@
+{
+  "name": "portfolio-demo",
+  "requests_per_minute": 60,
+  "daily_token_budget": 100000
+}
