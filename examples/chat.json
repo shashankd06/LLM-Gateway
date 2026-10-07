@@ -1,0 +1,10 @@
+{
+  "model": "qwen2.5:1.5b",
+  "messages": [
+    {"role": "system", "content": "Answer briefly and accurately."},
+    {"role": "user", "content": "What is the capital of France?"}
+  ],
+  "temperature": 0,
+  "max_tokens": 64,
+  "stream": false
+}

@@ -1,0 +1,29 @@
+{
+  "date": "2026-10-06",
+  "phase": 1,
+  "python": "3.11.16",
+  "tests": {
+    "passed": 61,
+    "skipped": 1,
+    "failed": 0
+  },
+  "coverage": {
+    "combined_percent": 96.96,
+    "lines_covered": 333,
+    "lines_valid": 342,
+    "branches_covered": 18,
+    "branches_valid": 20,
+    "exclusions": [
+      "app/db/migrations/*"
+    ]
+  },
+  "ruff_lint": "passed",
+  "ruff_format": "passed",
+  "migration_sql": "passed (PostgreSQL offline upgrade and downgrade)",
+  "compose_yaml": "parsed; service topology inspected",
+  "live_postgres": "skipped: TEST_DATABASE_URL not supplied",
+  "docker_startup": "not run: Docker unavailable",
+  "live_ollama": "not run",
+  "test_command": "python -m pytest -p no:cacheprovider --tb=short",
+  "benchmark_results": null
+}
