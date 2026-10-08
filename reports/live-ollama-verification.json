@@ -1,0 +1,30 @@
+{
+  "started_at": "2026-10-08T05:42:55.607864+00:00",
+  "status": "passed",
+  "checks": {
+    "health": {
+      "status": "ok",
+      "database": true,
+      "provider": {
+        "name": "ollama",
+        "healthy": true
+      }
+    },
+    "real_inference": "passed",
+    "exact_cache": "passed",
+    "semantic_cache_case_variant": "passed",
+    "bypass": "passed",
+    "short_response_fallback": "passed",
+    "json_output": "passed",
+    "authentication": "passed",
+    "budget_429_retry_after": "passed",
+    "missing_model_sanitized_error": "passed",
+    "metrics": "passed",
+    "serving_models": {
+      "first": "qwen2.5:1.5b",
+      "fallback": "qwen2.5:7b"
+    },
+    "scope": "small functional smoke checks; not latency, quality, or savings benchmarks"
+  },
+  "finished_at": "2026-10-08T05:44:39.958103+00:00"
+}

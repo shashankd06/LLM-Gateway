@@ -1,0 +1,14 @@
+{
+  "started_at": "2026-10-08T05:38:28.380898+00:00",
+  "status": "database checks passed; live Ollama pending",
+  "compose_startup": "passed",
+  "tests": {
+    "tests": 222,
+    "skipped": 0,
+    "failures": 0,
+    "errors": 0
+  },
+  "live_postgres": "passed",
+  "live_ollama": "not run: database-only mode",
+  "finished_at": "2026-10-08T05:42:53.452576+00:00"
+}

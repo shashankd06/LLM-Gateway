@@ -485,6 +485,34 @@ decision logic and accounting, not model quality, production throughput, or late
 savings. The stored model, provider, tier, reason, and attempt count are checked
 through fake-provider API integration tests. No Phase 4 benchmark numbers are claimed.
 
+Full stack verification on 2026-10-08:
+
+| Check | Actual result |
+| --- | --- |
+| Docker Compose build and startup | Passed; gateway and PostgreSQL running |
+| Python 3.11.16 suite with real PostgreSQL + pgvector | 222 passed, none skipped |
+| Combined line + branch application coverage | 99.38% (1089/1091 lines; 192/198 branches) |
+| Live migrations through 0004, PostgreSQL concurrency, vector lookup, and TTL | Passed |
+| Live Ollama inference | Passed with qwen2.5:1.5b and qwen2.5:7b |
+| Exact cache, semantic case-variant cache, and bypass | Passed |
+| Short-response escalation to strong model and JSON output | Passed |
+| Authentication, budget 429 + Retry-After, sanitized upstream errors, and metrics | Passed |
+
+Evidence: [`stack-verification.json`](reports/stack-verification.json),
+[`stack-tests.xml`](reports/stack-tests.xml),
+[`stack-coverage.xml`](reports/stack-coverage.xml), and
+[`live-ollama-verification.json`](reports/live-ollama-verification.json).
+The semantic smoke check changes casing to exercise real MiniLM and pgvector
+with a different prompt hash. It does not establish paraphrase quality or a
+dataset hit rate. All live checks are functional checks, not performance benchmarks.
+
+`scripts/Test-Stack.ps1 -DatabaseOnly` builds Compose and runs the full suite
+against an additional disposable PostgreSQL container. Without `-DatabaseOnly`,
+it also runs the live gateway checks and requires both Ollama models. Existing
+Compose data is preserved. The local workspace helper
+`scripts/Start-LocalOllama.ps1` starts the downloaded portable Ollama runtime on
+localhost and pulls the two models; it expects this workspace's `work/ollama` directory.
+
 ## Evaluation results
 
 Pending Phase 5. No latency, quality, cache-hit, routing, or cost-savings benchmark
